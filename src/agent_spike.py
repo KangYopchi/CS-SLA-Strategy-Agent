@@ -1,242 +1,178 @@
 """
-SLA Strategy Recommendation Agent (Spike)
-LangGraph를 사용한 간단한 전략 추천 시스템
+SLA-Agent-Manager
 """
 
-import json
-from typing import Annotated, TypedDict
+# 1 - Data Loader
+# 2 - Analyze Data
+# 3 - Create Strategy
+# 4 - Show the result
+
+from typing import Annotated, Literal
 
 import pandas as pd
+from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
+from pydantic import BaseModel, Field
+
+load_dotenv()
 
 
-# State 정의
-class AgentState(TypedDict):
-    """Agent의 상태를 저장하는 클래스"""
-
-    # 입력
-    user_input: str
-    weather: str
-    budget: int
-
-    # 중간 결과
-    all_data: str  # CSV 데이터 (문자열로 변환)
-    filtered_strategies: str  # 필터링된 전략들
-
-    # 출력
-    recommendation: str
-    messages: Annotated[list, add_messages]
+class AgentState(BaseModel):
+    csv_path: str | None = Field(default=None, description="CSV file path")
+    income_call: int = Field(default=0, description="income call counts")
+    answer_call: int = Field(default=0, description="answer call counts")
+    sla_goal: str | None = Field(default="S", description="Goal of SLA")
+    sla_result: str | None = Field(default=None, description="Result of sla")
+    report: dict | None = Field(
+        default=None, description="Data from AI, Report from yesterday data"
+    )
+    simulation: str | None = Field(default=None, description="Story of simulation")
+    message: Annotated[list, add_messages] = Field(default_factory=list)
 
 
-# Node 1: 사용자 입력 파싱
-def parse_input(state: AgentState) -> AgentState:
-    """
-    사용자 입력을 파싱하여 날씨와 예산 추출
-    예: "폭설 예보, 예산 50만원" → weather="Snow", budget=500000
-    """
-    user_input = state["user_input"]
-
-    # 간단한 파싱 (실제로는 LLM 사용 가능)
-    weather_map = {"맑": "Sunny", "비": "Rain", "눈": "Snow", "폭설": "Snow"}
-
-    weather = "Sunny"  # 기본값
-    for key, value in weather_map.items():
-        if key in user_input:
-            weather = value
-            break
-
-    # 예산 추출 (숫자 찾기)
-    budget = None
-    if "만원" in user_input:
-        # "50만원" → 500000
-        import re
-
-        numbers = re.findall(r"(\d+)만원", user_input)
-        if numbers:
-            budget = int(numbers[0]) * 10000
-
-    state["weather"] = weather
-    state["budget"] = budget if budget else 999999999  # 제한 없으면 무한대
-
-    return state
+class ReportFromYesterday(BaseModel):
+    summary: str = Field(description="Summany of Strategy and report")
+    urgency: Literal["low", "medium", "high", "critical"]
+    report: str = Field(description="Report of today's strategy")
 
 
-# Node 2: 데이터 로드 및 필터링
-def load_and_filter_data(state: AgentState) -> AgentState:
-    """
-    CSV 데이터를 로드하고 날씨와 예산에 맞게 필터링
-    """
-    # CSV 로드
-    df = pd.read_csv("data/level1_clean.csv")
+def load_data(state: AgentState) -> AgentState:
+    # state에서 csv_path를 가져오거나 기본값 사용
+    csv_path = getattr(state, "csv_path", "data/yesterday_calls.csv")
 
-    # 전체 데이터 저장 (컨텍스트용)
-    state["all_data"] = df.to_string(index=False)
+    sla_result: str = "ERROR"  # 초기값 설정 (에러 발생 시 사용)
 
-    # 필터링
-    weather = state["weather"]
-    budget = state["budget"]
+    try:
+        df = pd.read_csv(csv_path)
+        income_call: int = int(df["인입콜"].sum())
+        answer_call: int = int(df["응답콜"].sum())
 
-    filtered = df[(df["weather"] == weather) & (df["cost"] <= budget)].copy()
+        # 0으로 나누기 방지
+        if income_call == 0:
+            raise ValueError("인입콜이 0입니다. 계산할 수 없습니다.")
 
-    # 순이익 기준 정렬
-    filtered = filtered.sort_values("profit", ascending=False)
+        # 계산 순서 수정: 곱하기 후 반올림
+        result = round((answer_call / income_call) * 100, 2)
 
-    # 상위 5개만 (너무 많으면 LLM 부담)
-    filtered = filtered.head(5)
+        if result >= 95:
+            sla_result = "S"
+        elif result >= 90:
+            sla_result = "A"
+        elif result >= 85:
+            sla_result = "B"
+        elif result >= 80:
+            sla_result = "C"
+        elif result >= 75:
+            sla_result = "D"
+        else:
+            sla_result = "DD"
 
-    state["filtered_strategies"] = filtered.to_string(index=False)
+        print(f"calculate result: {sla_result} ")
+        state.income_call = income_call
+        state.answer_call = answer_call
+        state.sla_result = sla_result
+    except FileNotFoundError:
+        print(f"Data Load error: 파일을 찾을 수 없습니다 - {csv_path}")
+        state.income_call = 0
+        state.answer_call = 0
+        state.sla_result = "ERROR"
+    except Exception as e:
+        print(f"Data Load error: {e}")
+        state.income_call = 0
+        state.answer_call = 0
+        state.sla_result = "ERROR"
 
     return state
 
 
-# Node 3: LLM 분석 및 추천
-def llm_recommend(state: AgentState) -> AgentState:
-    """
-    LLM을 사용하여 최적 전략 추천 및 설명
-    """
-    # 프롬프트 구성
+def generate_report(state: AgentState) -> AgentState:
     prompt = f"""
-당신은 CS센터 SLA 최적화 전문가입니다.
+    <persona>
+    당신은 목표 SLA 달성을 위한 전략을 제안하는 AI Agent입니다. 어제 일자의 데이터를 바탕으로 나온 SLA 결과를 확인하고 금일 시뮬레이션 상황에 맞는 전략을 세워주세요.
+    <persona>
+    <simulation>
+    {state.simulation}
+    </simulation>
+    <report>
+    어제 콜 인입량: {state.income_call}
+    어제 콜 응답량: {state.answer_call}
+    어제 SLA: {state.sla_result}
+    목표 SLA: {state.sla_goal}
+    </report>
+    """
 
-## 상황
-- 날씨: {state["weather"]}
-- 가용 예산: {state["budget"]:,}원
+    llm = ChatOpenAI(model="gpt-5-mini")
 
-## 컬럼 설명
-- weather: 날씨 (Sunny/Rain/Snow)
-- staff_emergency: 휴무자 긴급 투입 인원 (1명당 4만원)
-- staff_overtime: 초과근무/조기출근 인원 (1명당 5만원)
-- staff_fasttrack: 간단한 콜만 처리하는 전담팀 (비용 0원, 품질 약간 하락)
-- calls_inbound: 예상 인입 콜 수
-- calls_answered: 예상 응답 콜 수
-- response_rate: 응답률 (%)
-- grade: SLA 등급 (S/A/B/C/D)
-- cost: 전략 비용
-- profit: 순이익 (최종 목표!)
-- roi: 투자 수익률
+    structured_llm = llm.with_structured_output(ReportFromYesterday)
 
-## 가능한 전략들 (순이익 순)
-{state["filtered_strategies"]}
+    report = structured_llm.invoke(prompt)
 
-## 질문
-위 전략 중 어떤 것을 추천하시나요?
-
-**추천 형식:**
-1. 추천 전략: [구체적 인원 명시]
-2. 예상 결과: [응답률, 등급, 순이익]
-3. 선택 이유: [왜 이 전략이 최적인지 2-3문장]
-
-간단명료하게 답변해주세요.
-"""
-
-    # 실제로는 여기서 Anthropic API 호출
-    # 지금은 Spike라 간단하게 규칙 기반으로
-    filtered_df = pd.read_csv("data/level1_clean.csv")
-    filtered_df = filtered_df[
-        (filtered_df["weather"] == state["weather"])
-        & (filtered_df["cost"] <= state["budget"])
-    ].sort_values("profit", ascending=False)
-
-    if len(filtered_df) == 0:
-        state["recommendation"] = "예산 내 가능한 전략이 없습니다."
-        return state
-
-    best = filtered_df.iloc[0]
-
-    recommendation = f"""
-## 추천 전략
-
-**투입 인원:**
-- 긴급 투입: {int(best["staff_emergency"])}명
-- 초과 근무: {int(best["staff_overtime"])}명
-- FastTrack: {int(best["staff_fasttrack"])}명
-
-**예상 결과:**
-- 응답률: {best["response_rate"]:.1f}%
-- SLA 등급: {best["grade"]}등급
-- 비용: {int(best["cost"]):,}원
-- 순이익: {int(best["profit"]):,}원
-- ROI: {best["roi"]:.1f}%
-
-**선택 이유:**
-이 전략은 예산 {state["budget"]:,}원 내에서 순이익을 최대화합니다.
-{state["weather"]} 날씨에서 응답률 {best["response_rate"]:.0f}%를 달성하여
-{best["grade"]}등급을 받을 수 있으며, 최종적으로 {int(best["profit"]):,}원의
-순이익이 예상됩니다.
-"""
-
-    state["recommendation"] = recommendation
+    state.report = report
 
     return state
 
 
-# Graph 구성
 def create_graph():
-    """LangGraph 생성"""
     workflow = StateGraph(AgentState)
 
-    # Node 추가
-    workflow.add_node("parse", parse_input)
-    workflow.add_node("filter", load_and_filter_data)
-    workflow.add_node("recommend", llm_recommend)
+    workflow.add_node("load_data", load_data)
+    workflow.add_node("generate_report", generate_report)
 
-    # Edge 추가
-    workflow.add_edge(START, "parse")
-    workflow.add_edge("parse", "filter")
-    workflow.add_edge("filter", "recommend")
-    workflow.add_edge("recommend", END)
+    workflow.add_edge(START, "load_data")
+    workflow.add_edge("load_data", "generate_report")
+    workflow.add_edge("generate_report", END)
 
-    # 컴파일
     app = workflow.compile()
 
     return app
 
 
-# 실행 함수
-def run_agent(user_input: str):
-    """Agent 실행"""
+def run_agent(
+    csv_path: str = "data/yesterday_calls.csv",
+    sla_goal: str = "A",
+    simulation: str | None = None,
+):
+    """
+    Agent를 실행합니다.
+
+    Args:
+        csv_path: CSV 파일 경로
+        sla_goal: 목표 SLA 등급
+        simulation: 시뮬레이션 시나리오 (선택사항)
+
+    Returns:
+        실행 결과 (AgentState 객체 또는 dict)
+    """
     app = create_graph()
 
-    initial_state = AgentState(
-        {
-            "user_input": user_input,
-            "weather": "",
-            "budget": 0,
-            "all_data": "",
-            "filtered_strategies": "",
-            "recommendation": "",
-            "messages": [],
-        }
+    default_simulation = (
+        "오늘 점심부터 눈이 올 예정이며, 저녁에는 폭설이 예상된다. "
+        "출근 인원은 20명이며, 고객사에서 60% 이상 콜 응대를 할 경우 A 등급으로 조정해준다고 한다."
     )
 
-    # initial_state = {
-    #     "user_input": user_input,
-    #     "weather": "",
-    #     "budget": 0,
-    #     "all_data": "",
-    #     "filtered_strategies": "",
-    #     "recommendation": "",
-    #     "messages": [],
-    # }
+    initState = AgentState(
+        csv_path=csv_path,
+        sla_goal=sla_goal,
+        sla_result=None,
+        report=None,
+        simulation=simulation if simulation is not None else default_simulation,
+        message=[],
+    )
 
-    result = app.invoke(initial_state)
+    result = app.invoke(initState)
 
-    return result["recommendation"]
+    # 테스트를 위해 dict 형태로도 반환 가능하도록
+    if hasattr(result, "model_dump"):
+        return result.model_dump()
+    elif hasattr(result, "dict"):
+        return result.dict()
+    else:
+        return result
 
 
-# 테스트
 if __name__ == "__main__":
-    print("=== SLA 전략 추천 Agent (Spike) ===\n")
+    result = run_agent()
 
-    # 테스트 케이스
-    test_cases = [
-        "폭설 예보인데 예산 50만원 있어",
-        "비가 올 것 같은데 예산은 무제한이야",
-        "맑은 날씨야",
-    ]
-
-    for test in test_cases:
-        print(f"📍 질문: {test}")
-        print(run_agent(test))
-        print("\n" + "=" * 60 + "\n")
+    print(result["report"])

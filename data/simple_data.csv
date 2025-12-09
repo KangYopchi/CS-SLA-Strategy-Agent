@@ -1,0 +1,10 @@
+weather,staff,calls,answered,rate,grade
+Sunny,0,1000,950,95,S
+Sunny,3,1000,980,98,S
+Sunny,5,1000,990,99,S
+Rain,0,1200,1020,85,B
+Rain,5,1200,1080,90,A
+Rain,10,1200,1140,95,S
+Snow,0,1500,900,60,D
+Snow,10,1500,1125,75,C
+Snow,20,1500,1425,95,S
