@@ -1,178 +1,303 @@
 """
-SLA-Agent-Manager
+Agent Spike 를 작성한 파일입니다.
+
+Google Sheets에서 데이터 파싱 -> 데이터 분석 -> Report 작성 -> Report 출력으로 연결됩니다.
+
+입력값 -> 오늘의 날씨, 출근 인원, 고객사 응대 요청 사항
 """
 
-# 1 - Data Loader
-# 2 - Analyze Data
-# 3 - Create Strategy
-# 4 - Show the result
-
-from typing import Annotated, Literal
+import asyncio
+import os
+from pathlib import Path
+from typing import Annotated, Any, Literal, TypedDict
 
 import pandas as pd
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
+from langfuse.langchain import CallbackHandler
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
+from langgraph.graph.state import CompiledStateGraph
 from pydantic import BaseModel, Field
 
-load_dotenv()
+SLA_GRADES: dict[str, int] = {"S": 95, "A": 90, "B": 85, "C": 80, "D": 75, "DD": 0}
 
 
-class AgentState(BaseModel):
-    csv_path: str | None = Field(default=None, description="CSV file path")
-    income_call: int = Field(default=0, description="income call counts")
-    answer_call: int = Field(default=0, description="answer call counts")
-    sla_goal: str | None = Field(default="S", description="Goal of SLA")
-    sla_result: str | None = Field(default=None, description="Result of sla")
-    report: dict | None = Field(
-        default=None, description="Data from AI, Report from yesterday data"
+class OverallState(TypedDict):
+    messages: Annotated[list, add_messages]
+    spreadsheet_id: str | None
+    sheet_name: str | None
+    range_name: str | None
+    sheets_data: list[dict[str, Any]] | None
+    report: (
+        dict[
+            Literal["summary", "urgency", "strategy"],
+            str | Literal["low", "medium", "high", "critical"],
+        ]
+        | None
     )
-    simulation: str | None = Field(default=None, description="Story of simulation")
-    message: Annotated[list, add_messages] = Field(default_factory=list)
+    customer_request: str | None
+    condition: dict[Literal["weather", "event", "attendance_rate"], str | int | float]
+    yesterday_data: dict[Literal["income_call", "answer_call", "sla_result"], int | str]
 
 
-class ReportFromYesterday(BaseModel):
-    summary: str = Field(description="Summany of Strategy and report")
+class OverallStateVaildation(BaseModel):
+    messages: Annotated[list, add_messages]
+    spreadsheet_id: str | None = Field(
+        default=None, description="Google Sheets 스프레드시트 ID"
+    )
+    sheet_name: str | None = Field(
+        default=None, description="읽을 시트 이름 (예: 'Sheet1', '202501')"
+    )
+    range_name: str | None = Field(default=None, description="읽을 범위 (예: 'A1:D10')")
+    sheets_data: list[dict[str, Any]] | None = Field(
+        default=None, description="스프레드시트 데이터"
+    )
+    report: (
+        dict[
+            Literal["summary", "urgency", "strategy"],
+            str | Literal["low", "medium", "high", "critical"],
+        ]
+        | None
+    ) = Field(default=None, description="Report")
+    customer_request: str | None = Field(default=None, description="Request")
+    condition: dict[
+        Literal["weather", "event", "attendance_rate"], str | int | float
+    ] = Field(
+        default={"weather": "unknown", "event": "unknown", "attendance_rate": 0},
+        description="오늘의 상황",
+    )
+    yesterday_data: dict[
+        Literal["income_call", "answer_call", "sla_result"], int | str
+    ] = Field(
+        default={"income_call": 0, "answer_call": 0, "sla_result": "DD"},
+        description="어제의 데이터",
+    )
+
+
+class GoogleSheetsData(TypedDict):
+    sheets_data: list[dict[str, Any]] | None
+
+
+class AgentStrategy(BaseModel):
+    summary: str
     urgency: Literal["low", "medium", "high", "critical"]
-    report: str = Field(description="Report of today's strategy")
+    strategy: str
 
 
-def load_data(state: AgentState) -> AgentState:
-    # state에서 csv_path를 가져오거나 기본값 사용
-    csv_path = getattr(state, "csv_path", "data/yesterday_calls.csv")
+def vaildate_input_state(state: OverallState) -> OverallStateVaildation:
+    """입력 데이터 검증"""
+    return OverallStateVaildation(**state)
 
-    sla_result: str = "ERROR"  # 초기값 설정 (에러 발생 시 사용)
+
+async def load_sheets_data(state: OverallStateVaildation) -> GoogleSheetsData:
+    """
+    Google Sheets에서 데이터를 읽어오는 노드
+
+    Args:
+        state: SheetsAgentState 인스턴스
+
+    Returns:
+        State 업데이트를 위한 최소한의 데이터 dict
+    """
+    import sys
+
+    sys.path.append(str(Path(__file__).resolve().parents[1]))
+    from src.google_sheets_reader import GoogleSheetsReader
+
+    # State에서 필요한 정보 추출
+    spreadsheet_id: str | None = state.spreadsheet_id
+    sheet_name: str | None = state.sheet_name
+    range_name: str | None = state.range_name
+
+    if not spreadsheet_id:
+        raise ValueError("spreadsheet_id가 제공되지 않았습니다")
 
     try:
-        df = pd.read_csv(csv_path)
-        income_call: int = int(df["인입콜"].sum())
-        answer_call: int = int(df["응답콜"].sum())
+        # Reader 인스턴스 생성
+        credentials_path = Path("credentials.json")
+        reader = GoogleSheetsReader(credentials_path=credentials_path)
 
-        # 0으로 나누기 방지
-        if income_call == 0:
-            raise ValueError("인입콜이 0입니다. 계산할 수 없습니다.")
+        # 데이터 읽기
+        data: list[list[Any]] = reader.get_sheet_data(
+            spreadsheet_id=spreadsheet_id, sheet_name=sheet_name, range_name=range_name
+        )
 
-        # 계산 순서 수정: 곱하기 후 반올림
-        result = round((answer_call / income_call) * 100, 2)
+        # JSON 변환
+        json_data: list[dict[str, Any]] = reader.to_json(data, empty_cells_as_none=True)
 
-        if result >= 95:
-            sla_result = "S"
-        elif result >= 90:
-            sla_result = "A"
-        elif result >= 85:
-            sla_result = "B"
-        elif result >= 80:
-            sla_result = "C"
-        elif result >= 75:
-            sla_result = "D"
-        else:
-            sla_result = "DD"
+        return {
+            "sheets_data": json_data,
+        }
 
-        print(f"calculate result: {sla_result} ")
-        state.income_call = income_call
-        state.answer_call = answer_call
-        state.sla_result = sla_result
-    except FileNotFoundError:
-        print(f"Data Load error: 파일을 찾을 수 없습니다 - {csv_path}")
-        state.income_call = 0
-        state.answer_call = 0
-        state.sla_result = "ERROR"
     except Exception as e:
-        print(f"Data Load error: {e}")
-        state.income_call = 0
-        state.answer_call = 0
-        state.sla_result = "ERROR"
-
-    return state
+        raise ValueError(f"스프레드시트 읽기 실패: {str(e)}")
 
 
-def generate_report(state: AgentState) -> AgentState:
+def calculate_sla_grade(state: GoogleSheetsData) -> OverallState:
+    """
+    SLA 등급을 계산하는 함수
+
+    Args:
+        state: GoogleSheetsState 인스턴스
+
+    Returns:
+        OverallState 인스턴스
+    """
+
+    data: list[dict[str, Any]] | None = state["sheets_data"]
+    df = pd.DataFrame(data)
+
+    df["answer_call"] = df["answer_call"].astype(int)
+    df["income_call"] = df["income_call"].astype(int)
+    sla_rate = round((df["answer_call"].sum() / df["income_call"].sum()) * 100, 2)
+
+    grade = "DD"
+
+    for grade, threshold in SLA_GRADES.items():
+        if sla_rate >= threshold:
+            grade = grade
+            break
+
+    income_call = df["income_call"].sum()
+    answer_call = df["answer_call"].sum()
+
+    return {
+        "yesterday_data": {
+            "income_call": income_call,
+            "answer_call": answer_call,
+            "sla_result": grade,
+        }
+    }
+
+
+async def generate_report(state: OverallState) -> OverallState:
+    """
+    Report를 생성하는 함수
+
+    Args:
+        state: OverallState 인스턴스
+
+    Returns:
+        OverallState 인스턴스
+    """
+
     prompt = f"""
     <persona>
-    당신은 목표 SLA 달성을 위한 전략을 제안하는 AI Agent입니다. 어제 일자의 데이터를 바탕으로 나온 SLA 결과를 확인하고 금일 시뮬레이션 상황에 맞는 전략을 세워주세요.
-    <persona>
-    <simulation>
-    {state.simulation}
-    </simulation>
-    <report>
-    어제 콜 인입량: {state.income_call}
-    어제 콜 응답량: {state.answer_call}
-    어제 SLA: {state.sla_result}
-    목표 SLA: {state.sla_goal}
-    </report>
+    당신은 CS 센터의 운영자입니다. 아래의 데이터를 바탕으로 Report를 Rule에 맞춰 작성해주세요. 말투는 센터장님의 근엄한 말투로 실장들에게 전달해주세요.
+    </persona>
+    <rule>
+    1. 고객사 요구사항을 우선적으로 충족시키도록 해주세요.
+    2. 어제의 SLA 결과를 바탕으로 오늘의 상황을 고려하여 Report를 작성해주세요.
+    3. 오늘의 날씨, 이벤트, 출근인원 비율의 상황을 고려하여 전략을 세워주세요.
+    4. Report는 최대 500자 이내로 작성해주세요.
+    </rule>
+    <data>
+    <yesterday_result>
+    어제 콜 인입량: {state["yesterday_data"]["income_call"]}
+    어제 콜 응답량: {state["yesterday_data"]["answer_call"]}
+    어제 SLA: {state["yesterday_data"]["sla_result"]}
+    </yesterday_result>
+    <customer_request>
+    오늘의 고객사 요구사항입니다: {state["customer_request"]}
+    </customer_request>
+    <condition>
+    오늘의 날씨: {state["condition"]["weather"]}
+    오늘의 이벤트: {state["condition"]["event"]}
+    오늘의 출근인원 비율: {state["condition"]["attendance_rate"]}
+    </condition>
+    </data>
+
+    <example>
+    summary: 폭설로 인한 인원 추가 및 AUX 최소화 전략
+    urgency: critical
+    strategy:
+    1. 오늘은 **폭설**이 예상됩니다. 고객사 요청사항입니다. 배달지연에 대해서는 "도착시간 확인불가"로 통일되게 대응해 ATT를 최대한 줄여주세요.
+    2. 어제 폭설로 인해 10~14시 사이에 AHT가 급증했습니다. 해당 시간에는 AUX가 발생하지 않도록 이석 관리가 필요합니다. 식사시간을 최대한 조정해서 AUX를 최소화 해주세요.
+    3. 또한 오늘은 출근인원 비율이 높지 않습니다. 따라서 휴무인 인원 중 일부를 추가 근무 가능한지 확인해주세요.
+    4. 어제 SLA 점수가 낮습니다. 금일 응답콜 목표를 60% 달성할 경우 A 등급을 받기로 했습니다. 응답콜을 높이기 위해 배달지연, 단순확인 등의 콜은 일관된 답변을 제공해주세요.
+    </example>
     """
 
     llm = ChatOpenAI(model="gpt-5-mini")
+    structured_llm = llm.with_structured_output(AgentStrategy)
 
-    structured_llm = llm.with_structured_output(ReportFromYesterday)
+    report_strategy: AgentStrategy = structured_llm.invoke(prompt)
 
-    report = structured_llm.invoke(prompt)
-
-    state.report = report
-
-    return state
-
-
-def create_graph():
-    workflow = StateGraph(AgentState)
-
-    workflow.add_node("load_data", load_data)
-    workflow.add_node("generate_report", generate_report)
-
-    workflow.add_edge(START, "load_data")
-    workflow.add_edge("load_data", "generate_report")
-    workflow.add_edge("generate_report", END)
-
-    app = workflow.compile()
-
-    return app
+    return {
+        "report": {
+            "summary": report_strategy.summary,
+            "urgency": report_strategy.urgency,
+            "strategy": report_strategy.strategy,
+        }
+    }
 
 
-def run_agent(
-    csv_path: str = "data/yesterday_calls.csv",
-    sla_goal: str = "A",
-    simulation: str | None = None,
-):
+def validate_report(state: OverallState) -> OverallState:
     """
-    Agent를 실행합니다.
+    Report를 검증하는 함수
 
     Args:
-        csv_path: CSV 파일 경로
-        sla_goal: 목표 SLA 등급
-        simulation: 시뮬레이션 시나리오 (선택사항)
+        state: OverallState 인스턴스
 
     Returns:
-        실행 결과 (AgentState 객체 또는 dict)
+        OverallState 인스턴스
     """
-    app = create_graph()
 
-    default_simulation = (
-        "오늘 점심부터 눈이 올 예정이며, 저녁에는 폭설이 예상된다. "
-        "출근 인원은 20명이며, 고객사에서 60% 이상 콜 응대를 할 경우 A 등급으로 조정해준다고 한다."
+    return OverallState(**OverallStateVaildation(**state).model_dump())
+
+
+def create_graph() -> CompiledStateGraph:
+    workflow = StateGraph(OverallState)
+
+    workflow.add_node("vaildate_input_state", vaildate_input_state)
+    workflow.add_node("load_sheets_data", load_sheets_data)
+    workflow.add_node("calculate_sla_grade", calculate_sla_grade)
+    workflow.add_node("generate_report", generate_report)
+    workflow.add_node("validate_report", validate_report)
+
+    workflow.add_edge(START, "vaildate_input_state")
+    workflow.add_edge("vaildate_input_state", "load_sheets_data")
+    workflow.add_edge("load_sheets_data", "calculate_sla_grade")
+    workflow.add_edge("calculate_sla_grade", "generate_report")
+    # workflow.add_edge("generate_report", "validate_report")
+    workflow.add_edge("generate_report", END)
+
+    graph = workflow.compile()
+
+    return graph
+
+
+async def main() -> None:
+    graph: CompiledStateGraph = create_graph()
+
+    load_dotenv()
+
+    spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
+
+    langfuse_callback = CallbackHandler()
+
+    if not spreadsheet_id:
+        raise ValueError("GOOGLE_SPREADSHEET_ID is not set")
+
+    sheet_name = "202501"
+
+    result = await graph.ainvoke(
+        {
+            "spreadsheet_id": spreadsheet_id,
+            "sheet_name": sheet_name,
+            "customer_request": "폭설로 인해 배달지연에 대해서는 '도착시간 확인불가'로 통일되게 대응해 ATT를 최대한 줄여주세요.",
+            "condition": {
+                "weather": "폭설",
+                "event": "None",
+                "attendance_rate": 0.6,
+            },
+        },
+        config={"callbacks": [langfuse_callback]},
     )
 
-    initState = AgentState(
-        csv_path=csv_path,
-        sla_goal=sla_goal,
-        sla_result=None,
-        report=None,
-        simulation=simulation if simulation is not None else default_simulation,
-        message=[],
-    )
-
-    result = app.invoke(initState)
-
-    # 테스트를 위해 dict 형태로도 반환 가능하도록
-    if hasattr(result, "model_dump"):
-        return result.model_dump()
-    elif hasattr(result, "dict"):
-        return result.dict()
-    else:
-        return result
+    print(result["report"])
 
 
 if __name__ == "__main__":
-    result = run_agent()
-
-    print(result["report"])
+    asyncio.run(main())

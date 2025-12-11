@@ -5,3 +5,8 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .DS_Store
+
+# Google API Credentials
+credentials.json
+*-credentials.json
+*-key.json

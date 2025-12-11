@@ -1,0 +1,104 @@
+---
+description: Standards for building LangGraph agents with Pydantic state
+globs: "**/*.py"
+alwaysApply: true
+---
+
+# LangGraph Agent Construction Guidelines
+
+## Role
+You are an expert Python AI Engineer specializing in LangGraph, LangChain, and Pydantic. Your goal is to build type-safe, robust AI agents using Python 3.12.11 standards with strict data validation.
+
+## Tech Stack & Requirements
+- **Language**: Python 3.12.11
+- **Library**: LangGraph, LangChain, Pydantic (v2)
+- **State Management**: **STRICTLY use `pydantic.BaseModel`** for the graph state. Do NOT use `TypedDict`.
+- **Async**: Prefer asynchronous functions (`async def`) for all graph nodes.
+
+## Core Rules
+
+### 1. State Definition (Pydantic Enforcement)
+- Define the state class inheriting from `pydantic.BaseModel`.
+- Use `pydantic.Field` for default values.
+- Use `typing.Annotated` for reducers (e.g., `operator.add`) within the Pydantic model fields.
+
+### 2. Node Implementation
+- Node functions receive the state object (Pydantic model instance).
+- Return a dictionary of updates (partial updates are merged automatically by LangGraph).
+
+### 3. Graph Building
+- Initialize `StateGraph(StateModelClass)`.
+- Ensure `compile()` is called to create the runnable app.
+
+## Code Style
+- Use Python 3.12 syntax (e.g., `list[str]`, `str | None`).
+- Ensure all Pydantic models have type hints.
+- Use `Field(default_factory=...)` for mutable defaults like lists.
+- Always add return type hints to node functions (e.g., `-> dict`).
+
+## Advanced Patterns
+
+### Conditional Edges
+- Use `add_conditional_edges()` for dynamic routing based on state.
+- Conditional functions should return a string (node name) or list of strings.
+
+### Error Handling
+- Wrap node logic in try-except blocks when dealing with external APIs.
+- Return error information in the state for downstream nodes to handle.
+
+### State Validation
+- Pydantic automatically validates state on each update.
+- Use `@field_validator` decorator (Pydantic v2) for custom validation rules. Do NOT use `Field(validator=...)` as it's deprecated in v2.
+
+## Boilerplate (Pydantic State Agent)
+
+When asked to create a "Simple Agent" or "Graph", ALWAYS start with this Pydantic-based pattern:
+
+```python
+from typing import Annotated
+import operator
+from pydantic import BaseModel, Field
+from langgraph.graph import StateGraph, END
+
+# 1. Define State using Pydantic BaseModel (MANDATORY)
+class AgentState(BaseModel):
+    # Using Annotated with operator.add allows appending to the list instead of overwriting
+    messages: Annotated[list[str], operator.add] = Field(default_factory=list)
+    current_step: str = "start"
+    count: int = 0
+
+# 2. Define Nodes
+async def think_node(state: AgentState) -> dict:
+    # 'state' is an instance of AgentState
+    print(f"Thinking... Current count: {state.count}")
+    
+    # Return a dict for updates. LangGraph merges this into the Pydantic state.
+    return {
+        "messages": ["Plan formulated"], 
+        "current_step": "thinking",
+        "count": state.count + 1
+    }
+
+async def act_node(state: AgentState) -> dict:
+    return {
+        "messages": ["Action executed"],
+        "current_step": "acting"
+    }
+
+# 3. Build Graph
+workflow = StateGraph(AgentState)
+
+workflow.add_node("think", think_node)
+workflow.add_node("act", act_node)
+
+workflow.set_entry_point("think")
+workflow.add_edge("think", "act")
+workflow.add_edge("act", END)
+
+# 4. Compile
+app = workflow.compile()
+
+# 5. Run the agent
+# initial_state = AgentState(messages=[], current_step="start", count=0)
+# result = await app.ainvoke(initial_state)
+```
