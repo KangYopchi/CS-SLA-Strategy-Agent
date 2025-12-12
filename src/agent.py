@@ -1,20 +1,8 @@
-"""
-Agent Spike 를 작성한 파일입니다.
-
-Google Sheets에서 데이터 파싱 -> 데이터 분석 -> Report 작성 -> Report 출력으로 연결됩니다.
-
-입력값 -> 오늘의 날씨, 출근 인원, 고객사 응대 요청 사항
-"""
-
-import asyncio
-import os
 from pathlib import Path
-from typing import Annotated, Any, Literal, TypedDict
+from typing import Annotated, Any, Literal, TypedDict, cast
 
 import pandas as pd
-from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
-from langfuse.langchain import CallbackHandler
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.graph.state import CompiledStateGraph
@@ -85,12 +73,12 @@ class AgentStrategy(BaseModel):
     strategy: str
 
 
-def vaildate_input_state(state: OverallState) -> OverallStateVaildation:
+def validate_input_state(state: OverallState) -> OverallStateVaildation:
     """입력 데이터 검증"""
     return OverallStateVaildation(**state)
 
 
-async def load_sheets_data(state: OverallStateVaildation) -> GoogleSheetsData:
+def load_sheets_data(state: OverallStateVaildation) -> GoogleSheetsData:
     """
     Google Sheets에서 데이터를 읽어오는 노드
 
@@ -103,7 +91,7 @@ async def load_sheets_data(state: OverallStateVaildation) -> GoogleSheetsData:
     import sys
 
     sys.path.append(str(Path(__file__).resolve().parents[1]))
-    from src.google_sheets_reader import GoogleSheetsReader
+    from src.gs_reader import GoogleSheetsReader
 
     # State에서 필요한 정보 추출
     spreadsheet_id: str | None = state.spreadsheet_id
@@ -171,7 +159,7 @@ def calculate_sla_grade(state: GoogleSheetsData) -> OverallState:
     }
 
 
-async def generate_report(state: OverallState) -> OverallState:
+def generate_report(state: OverallState) -> OverallState:
     """
     Report를 생성하는 함수
 
@@ -222,7 +210,8 @@ async def generate_report(state: OverallState) -> OverallState:
     llm = ChatOpenAI(model="gpt-5-mini")
     structured_llm = llm.with_structured_output(AgentStrategy)
 
-    report_strategy: AgentStrategy = structured_llm.invoke(prompt)
+    # type hinting error 로 인해 cast 사용
+    report_strategy = cast(AgentStrategy, structured_llm.invoke(prompt))
 
     return {
         "report": {
@@ -250,14 +239,14 @@ def validate_report(state: OverallState) -> OverallState:
 def create_graph() -> CompiledStateGraph:
     workflow = StateGraph(OverallState)
 
-    workflow.add_node("vaildate_input_state", vaildate_input_state)
+    workflow.add_node("validate_input_state", validate_input_state)
     workflow.add_node("load_sheets_data", load_sheets_data)
     workflow.add_node("calculate_sla_grade", calculate_sla_grade)
     workflow.add_node("generate_report", generate_report)
     workflow.add_node("validate_report", validate_report)
 
-    workflow.add_edge(START, "vaildate_input_state")
-    workflow.add_edge("vaildate_input_state", "load_sheets_data")
+    workflow.add_edge(START, "validate_input_state")
+    workflow.add_edge("validate_input_state", "load_sheets_data")
     workflow.add_edge("load_sheets_data", "calculate_sla_grade")
     workflow.add_edge("calculate_sla_grade", "generate_report")
     # workflow.add_edge("generate_report", "validate_report")
@@ -266,38 +255,3 @@ def create_graph() -> CompiledStateGraph:
     graph = workflow.compile()
 
     return graph
-
-
-async def main() -> None:
-    graph: CompiledStateGraph = create_graph()
-
-    load_dotenv()
-
-    spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
-
-    langfuse_callback = CallbackHandler()
-
-    if not spreadsheet_id:
-        raise ValueError("GOOGLE_SPREADSHEET_ID is not set")
-
-    sheet_name = "202501"
-
-    result = await graph.ainvoke(
-        {
-            "spreadsheet_id": spreadsheet_id,
-            "sheet_name": sheet_name,
-            "customer_request": "폭설로 인해 배달지연에 대해서는 '도착시간 확인불가'로 통일되게 대응해 ATT를 최대한 줄여주세요.",
-            "condition": {
-                "weather": "폭설",
-                "event": "None",
-                "attendance_rate": 0.6,
-            },
-        },
-        config={"callbacks": [langfuse_callback]},
-    )
-
-    print(result["report"])
-
-
-if __name__ == "__main__":
-    asyncio.run(main())

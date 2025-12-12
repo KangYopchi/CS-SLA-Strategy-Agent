@@ -1,5 +1,5 @@
 """
-agent_spike.py 각 함수에 대한 단위 테스트.
+sla_agent.py 각 함수에 대한 단위 테스트.
 외부 의존성(LLM, Google Sheets)은 monkeypatch로 대체해 순수 함수 로직만 검증합니다.
 """
 
@@ -28,9 +28,9 @@ def base_state_dict():
 
 # vaildate_input_state --------------------------------------------------------
 def test_vaildate_input_state_returns_pydantic_model(base_state_dict):
-    result = agent_spike.vaildate_input_state(base_state_dict)
+    result = sla_agent.vaildate_input_state(base_state_dict)
 
-    assert isinstance(result, agent_spike.OverallStateVaildation)
+    assert isinstance(result, sla_agent.OverallStateVaildation)
     assert result.spreadsheet_id == "spreadsheet-123"
     assert result.condition["attendance_rate"] == 0.75
 
@@ -61,10 +61,10 @@ async def test_load_sheets_data_success(monkeypatch, base_state_dict):
                 {"income_call": 130, "answer_call": 110},
             ]
 
-    monkeypatch.setattr(agent_spike, "GoogleSheetsReader", FakeReader)
-    state_model = agent_spike.OverallStateVaildation(**base_state_dict)
+    monkeypatch.setattr(sla_agent, "GoogleSheetsReader", FakeReader)
+    state_model = sla_agent.OverallStateVaildation(**base_state_dict)
 
-    result = await agent_spike.load_sheets_data(state_model)
+    result = await sla_agent.load_sheets_data(state_model)
 
     assert result["sheets_data"][0]["income_call"] == 120
     assert len(result["sheets_data"]) == 2
@@ -75,10 +75,10 @@ async def test_load_sheets_data_without_spreadsheet_id_raises(
     monkeypatch, base_state_dict
 ):
     base_state_dict["spreadsheet_id"] = None
-    state_model = agent_spike.OverallStateVaildation(**base_state_dict)
+    state_model = sla_agent.OverallStateVaildation(**base_state_dict)
 
     with pytest.raises(ValueError):
-        await agent_spike.load_sheets_data(state_model)
+        await sla_agent.load_sheets_data(state_model)
 
 
 # calculate_sla_grade ---------------------------------------------------------
@@ -90,7 +90,7 @@ def test_calculate_sla_grade_summarizes_totals():
         ]
     }
 
-    result = agent_spike.calculate_sla_grade(state)
+    result = sla_agent.calculate_sla_grade(state)
     yesterday = result["yesterday_data"]
 
     assert yesterday["income_call"] == 200
@@ -117,14 +117,14 @@ async def test_generate_report_uses_structured_llm(monkeypatch, base_state_dict)
 
         def with_structured_output(self, model):
             return FakeStructuredLLM(
-                agent_spike.AgentStrategy(
+                sla_agent.AgentStrategy(
                     summary="테스트 요약",
                     urgency="high",
                     strategy="테스트 전략",
                 )
             )
 
-    monkeypatch.setattr(agent_spike, "ChatOpenAI", FakeChatOpenAI)
+    monkeypatch.setattr(sla_agent, "ChatOpenAI", FakeChatOpenAI)
 
     base_state_dict["yesterday_data"] = {
         "income_call": 150,
@@ -138,7 +138,7 @@ async def test_generate_report_uses_structured_llm(monkeypatch, base_state_dict)
     }
     base_state_dict["customer_request"] = "고객 요청"
 
-    result = await agent_spike.generate_report(base_state_dict)
+    result = await sla_agent.generate_report(base_state_dict)
 
     assert result["summary"] == "테스트 요약"
     assert result["urgency"] == "high"
@@ -147,7 +147,7 @@ async def test_generate_report_uses_structured_llm(monkeypatch, base_state_dict)
 
 # validate_report -------------------------------------------------------------
 def test_validate_report_returns_typed_dict(base_state_dict):
-    validated = agent_spike.validate_report(base_state_dict)
+    validated = sla_agent.validate_report(base_state_dict)
 
     assert isinstance(validated, dict)
     assert validated["yesterday_data"]["income_call"] == 100
@@ -156,7 +156,7 @@ def test_validate_report_returns_typed_dict(base_state_dict):
 
 # create_graph ----------------------------------------------------------------
 def test_create_graph_contains_all_nodes():
-    app = agent_spike.create_graph()
+    app = sla_agent.create_graph()
     graph = app.get_graph()
 
     nodes = set(graph.nodes)
@@ -188,15 +188,15 @@ async def test_main_executes_with_stubbed_graph(monkeypatch, capsys):
     def fake_create_graph():
         return fake_graph
 
-    monkeypatch.setattr(agent_spike, "create_graph", fake_create_graph)
-    monkeypatch.setattr(agent_spike, "load_dotenv", lambda: None)
+    monkeypatch.setattr(sla_agent, "create_graph", fake_create_graph)
+    monkeypatch.setattr(sla_agent, "load_dotenv", lambda: None)
     monkeypatch.setattr(
-        agent_spike.os,
+        sla_agent.os,
         "getenv",
         lambda key: "spreadsheet-id" if key == "GOOGLE_SPREADSHEET_ID" else None,
     )
 
-    await agent_spike.main()
+    await sla_agent.main()
     out = capsys.readouterr().out
 
     assert "done" in out

@@ -33,6 +33,7 @@ class GoogleSheetsReader:
             credentials_path: 서비스 계정 JSON 파일 경로 (서비스 계정 사용 시)
             token_path: OAuth 토큰 파일 경로 (OAuth 사용 시)
             scopes: Google API 스코프 (기본값: ['https://www.googleapis.com/auth/spreadsheets.readonly'])
+            sheets scopes list: https://developers.google.com/workspace/sheets/api/scopes?hl=ko
 
         Note:
             - **서비스 계정 사용 시**: 권한은 다음 세 가지가 모두 필요합니다:
